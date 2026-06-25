@@ -29,7 +29,8 @@ import android.widget.TextView;
 import com.jlxc.androidotgscrcpy.adb.AdbConnection;
 import com.jlxc.androidotgscrcpy.adb.AdbCrypto;
 import com.jlxc.androidotgscrcpy.adb.UsbAdbDevice;
-import com.jlxc.androidotgscrcpy.video.ScreenRecordStreamer;
+import com.jlxc.androidotgscrcpy.scrcpy.ScrcpyControlClient;
+import com.jlxc.androidotgscrcpy.scrcpy.ScrcpyRawStreamer;
 
 import java.util.HashMap;
 import java.util.Locale;
@@ -41,7 +42,8 @@ public class MainActivity extends Activity {
     private UsbManager usbManager;
     private UsbDevice selectedDevice;
     private AdbConnection adb;
-    private ScreenRecordStreamer streamer;
+    private ScrcpyRawStreamer streamer;
+    private ScrcpyControlClient scrcpyControl;
 
     private TextView logView;
     private TextView titleView;
@@ -128,7 +130,7 @@ public class MainActivity extends Activity {
         root.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 7));
 
         titleView = new TextView(this);
-        titleView.setText("OTG Scrcpy Demo V2 / ADB Host");
+        titleView.setText("Android OTG Scrcpy V3 / true scrcpy-server 4.0");
         titleView.setTextColor(Color.rgb(57, 197, 187));
         titleView.setTextSize(18);
         titleView.setGravity(Gravity.CENTER_VERTICAL);
@@ -166,7 +168,7 @@ public class MainActivity extends Activity {
         addButton(right, "刷新 USB", new View.OnClickListener() { @Override public void onClick(View v) { refreshUsbDevices(); } });
         addButton(right, "连接 ADB", new View.OnClickListener() { @Override public void onClick(View v) { connectAdb(); } });
         addButton(right, "读取设备信息", new View.OnClickListener() { @Override public void onClick(View v) { readDeviceInfo(); } });
-        addButton(right, "开始预览", new View.OnClickListener() { @Override public void onClick(View v) { startPreview(); } });
+        addButton(right, "启动真 scrcpy", new View.OnClickListener() { @Override public void onClick(View v) { startPreview(); } });
         addButton(right, "停止预览", new View.OnClickListener() { @Override public void onClick(View v) { stopPreview(); } });
 
         LinearLayout viewRow = new LinearLayout(this);
@@ -190,11 +192,18 @@ public class MainActivity extends Activity {
         addButton(moreKeys, "音量-", new View.OnClickListener() { @Override public void onClick(View v) { keyEvent(25); } }, 1);
         addButton(moreKeys, "音量+", new View.OnClickListener() { @Override public void onClick(View v) { keyEvent(24); } }, 1);
 
+        LinearLayout scrcpyKeys = new LinearLayout(this);
+        scrcpyKeys.setOrientation(LinearLayout.HORIZONTAL);
+        right.addView(scrcpyKeys, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
+        addButton(scrcpyKeys, "熄屏投屏", new View.OnClickListener() { @Override public void onClick(View v) { setRemoteDisplayPower(false); } }, 1);
+        addButton(scrcpyKeys, "亮屏", new View.OnClickListener() { @Override public void onClick(View v) { setRemoteDisplayPower(true); } }, 1);
+        addButton(scrcpyKeys, "旋转", new View.OnClickListener() { @Override public void onClick(View v) { rotateRemote(); } }, 1);
+
         inputText = new EditText(this);
         inputText.setSingleLine(true);
         inputText.setTextColor(Color.WHITE);
         inputText.setHintTextColor(Color.rgb(100, 130, 130));
-        inputText.setHint("输入英文/数字后发送");
+        inputText.setHint("输入文本后发送，scrcpy 协议支持 UTF-8");
         inputText.setInputType(InputType.TYPE_CLASS_TEXT);
         inputText.setBackgroundColor(Color.rgb(18, 26, 28));
         right.addView(inputText, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
@@ -203,7 +212,7 @@ public class MainActivity extends Activity {
         logView = new TextView(this);
         logView.setTextColor(Color.rgb(210, 230, 230));
         logView.setTextSize(12);
-        logView.setText("准备就绪。V2 已加入比例/坐标修正、画质档位、常用按键。\n");
+        logView.setText("准备就绪。V3 改为官方 scrcpy-server v4.0：视频走 scrcpy raw stream，触控优先走 scrcpy control socket。\n");
         final ScrollView scroll = new ScrollView(this);
         scroll.addView(logView);
         right.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
@@ -211,9 +220,7 @@ public class MainActivity extends Activity {
         setContentView(root);
     }
 
-    private void addButton(LinearLayout parent, String text, View.OnClickListener listener) {
-        addButton(parent, text, listener, 0);
-    }
+    private void addButton(LinearLayout parent, String text, View.OnClickListener listener) { addButton(parent, text, listener, 0); }
 
     private void addButton(LinearLayout parent, String text, View.OnClickListener listener, int weight) {
         Button button = new Button(this);
@@ -240,11 +247,8 @@ public class MainActivity extends Activity {
             log("- " + device.getDeviceName() + " VID=" + device.getVendorId() + " PID=" + device.getProductId() + " ADB=" + adbInterface);
             if (adbInterface && selectedDevice == null) selectedDevice = device;
         }
-        if (selectedDevice == null) {
-            log("未发现 ADB 接口。请确认：被控端已开启 USB 调试，并且 OTG 主从方向正确。");
-        } else {
-            log("已选择: " + selectedDevice.getDeviceName());
-        }
+        if (selectedDevice == null) log("未发现 ADB 接口。请确认被控端已开启 USB 调试，并且 OTG 主从方向正确。");
+        else log("已选择: " + selectedDevice.getDeviceName());
         updateStatus();
     }
 
@@ -273,7 +277,7 @@ public class MainActivity extends Activity {
                         @Override public void log(String message) { MainActivity.this.log(message); }
                     });
                     adb.connect();
-                    log("连接成功，可以读取设备信息或开始预览。首次连接如果被控端弹授权，请点允许后再点一次连接。");
+                    log("ADB 连接成功。首次连接如果被控端弹授权，请点允许后再点一次连接。 ");
                     updateStatus();
                 } catch (Throwable t) {
                     log("连接失败: " + t.getClass().getSimpleName() + ": " + t.getMessage());
@@ -294,19 +298,14 @@ public class MainActivity extends Activity {
                     log("设备信息:\n" + out.trim());
                     parseRemoteSize(out);
                     updateVideoSize();
-                } catch (Throwable t) {
-                    log("读取失败: " + t.getMessage());
-                }
+                } catch (Throwable t) { log("读取失败: " + t.getMessage()); }
             }
         });
     }
 
     private void startPreview() {
         if (!ensureAdb()) return;
-        if (!surfaceReady) {
-            log("Surface 未就绪，稍后再试。");
-            return;
-        }
+        if (!surfaceReady) { log("Surface 未就绪，稍后再试。"); return; }
         stopPreview();
         runBg(new Runnable() {
             @Override public void run() {
@@ -316,50 +315,77 @@ public class MainActivity extends Activity {
                     updateVideoSize();
                 } catch (Throwable ignored) {}
                 VideoProfile profile = getVideoProfile();
-                streamer = new ScreenRecordStreamer(adb, surfaceView.getHolder().getSurface(),
-                        profile.width, profile.height, profile.bitRate, profile.useSizeOption,
-                        new ScreenRecordStreamer.LogSink() {
-                            @Override public void log(String message) { MainActivity.this.log(message); }
+                streamer = new ScrcpyRawStreamer(MainActivity.this, adb, surfaceView.getHolder().getSurface(),
+                        profile.width, profile.height, profile.maxSize, profile.bitRate,
+                        true, true,
+                        new ScrcpyRawStreamer.LogSink() { @Override public void log(String message) { MainActivity.this.log(message); } },
+                        new ScrcpyRawStreamer.ControlReadyCallback() {
+                            @Override public void onControlReady(ScrcpyControlClient client) {
+                                scrcpyControl = client;
+                                updateStatus();
+                            }
                         });
                 streamer.start();
-                log("触控映射：远端 " + remoteWidth + "x" + remoteHeight + "，视频 " + profile.width + "x" + profile.height + "，" + getQualityName());
+                log("启动真 scrcpy：远端 " + remoteWidth + "x" + remoteHeight + "，视频 " + profile.width + "x" + profile.height + "，" + getQualityName());
             }
         });
     }
 
     private void stopPreview() {
-        ScreenRecordStreamer s = streamer;
+        ScrcpyRawStreamer s = streamer;
         streamer = null;
+        scrcpyControl = null;
         if (s != null) {
             s.stop();
-            log("预览已停止。");
+            log("预览已停止。 ");
         }
+        updateStatus();
     }
 
     private boolean ensureAdb() {
-        if (adb == null || !adb.isConnected()) {
-            log("ADB 未连接。先点“连接 ADB”。");
-            return false;
-        }
+        if (adb == null || !adb.isConnected()) { log("ADB 未连接。先点“连接 ADB”。"); return false; }
         return true;
     }
 
     private void keyEvent(final int keyCode) {
         if (!ensureAdb()) return;
+        ScrcpyControlClient c = scrcpyControl;
+        if (c != null && c.isReady()) {
+            c.sendKey(keyCode);
+            return;
+        }
         runBg(new Runnable() { @Override public void run() { shellQuick("input keyevent " + keyCode); } });
+    }
+
+    private void setRemoteDisplayPower(boolean on) {
+        ScrcpyControlClient c = scrcpyControl;
+        if (c != null && c.isReady()) {
+            c.sendDisplayPower(on);
+            log(on ? "已通过 scrcpy control 请求亮屏。" : "已通过 scrcpy control 请求熄屏投屏。 ");
+        } else {
+            log("scrcpy control socket 未就绪。先启动真 scrcpy。 ");
+        }
+    }
+
+    private void rotateRemote() {
+        ScrcpyControlClient c = scrcpyControl;
+        if (c != null && c.isReady()) c.rotateDevice();
+        else log("scrcpy control socket 未就绪。 ");
     }
 
     private void sendTextToRemote() {
         if (!ensureAdb()) return;
         final String raw = inputText == null ? "" : inputText.getText().toString();
         if (raw.length() == 0) return;
+        ScrcpyControlClient c = scrcpyControl;
+        if (c != null && c.isReady()) {
+            c.sendText(raw);
+            return;
+        }
         runBg(new Runnable() {
             @Override public void run() {
                 String encoded = encodeInputText(raw);
-                if (encoded.length() == 0) {
-                    log("文本为空或包含过多 input text 不兼容字符。");
-                    return;
-                }
+                if (encoded.length() == 0) { log("文本为空或包含过多 input text 不兼容字符。"); return; }
                 shellQuick("input text " + encoded);
             }
         });
@@ -367,12 +393,40 @@ public class MainActivity extends Activity {
 
     private boolean handleRemoteTouch(View view, MotionEvent event) {
         if (adb == null || !adb.isConnected()) return true;
+        ScrcpyControlClient c = scrcpyControl;
+        if (c != null && c.isReady()) return handleScrcpyTouch(view, event, c);
+        return handleAdbFallbackTouch(view, event);
+    }
+
+    private boolean handleScrcpyTouch(View view, MotionEvent event, ScrcpyControlClient c) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_MOVE) {
+            for (int i = 0; i < event.getPointerCount(); i++) {
+                Point p = mapToRemote(view, event.getX(i), event.getY(i));
+                c.sendTouch(MotionEvent.ACTION_MOVE, event.getPointerId(i), p.x, p.y, remoteWidth, remoteHeight, 1f);
+            }
+            return true;
+        }
+        int index = event.getActionIndex();
+        if (index < 0 || index >= event.getPointerCount()) index = 0;
+        int outAction = action;
+        float pressure = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP || action == MotionEvent.ACTION_CANCEL) ? 0f : 1f;
+        if (action == MotionEvent.ACTION_CANCEL) {
+            for (int i = 0; i < event.getPointerCount(); i++) {
+                Point p = mapToRemote(view, event.getX(i), event.getY(i));
+                c.sendTouch(MotionEvent.ACTION_UP, event.getPointerId(i), p.x, p.y, remoteWidth, remoteHeight, 0f);
+            }
+            return true;
+        }
+        Point p = mapToRemote(view, event.getX(index), event.getY(index));
+        c.sendTouch(outAction, event.getPointerId(index), p.x, p.y, remoteWidth, remoteHeight, pressure);
+        return true;
+    }
+
+    private boolean handleAdbFallbackTouch(View view, MotionEvent event) {
         int action = event.getActionMasked();
         if (action == MotionEvent.ACTION_DOWN) {
-            downX = event.getX();
-            downY = event.getY();
-            downTime = System.currentTimeMillis();
-            return true;
+            downX = event.getX(); downY = event.getY(); downTime = System.currentTimeMillis(); return true;
         }
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
             final Point p1 = mapToRemote(view, downX, downY);
@@ -383,11 +437,8 @@ public class MainActivity extends Activity {
             runBg(new Runnable() {
                 @Override public void run() {
                     if (Math.hypot(dx, dy) < dp(10)) {
-                        if (duration >= 500) {
-                            shellQuick("input swipe " + p2.x + " " + p2.y + " " + p2.x + " " + p2.y + " " + duration);
-                        } else {
-                            shellQuick("input tap " + p2.x + " " + p2.y);
-                        }
+                        if (duration >= 500) shellQuick("input swipe " + p2.x + " " + p2.y + " " + p2.x + " " + p2.y + " " + duration);
+                        else shellQuick("input tap " + p2.x + " " + p2.y);
                     } else {
                         long swipeDuration = Math.max(80, Math.min(1500, duration));
                         shellQuick("input swipe " + p1.x + " " + p1.y + " " + p2.x + " " + p2.y + " " + swipeDuration);
@@ -422,11 +473,7 @@ public class MainActivity extends Activity {
     }
 
     private void shellQuick(String cmd) {
-        try {
-            adb.shell(cmd, 2500);
-        } catch (Throwable t) {
-            log("命令失败: " + cmd + " / " + t.getMessage());
-        }
+        try { adb.shell(cmd, 2500); } catch (Throwable t) { log("命令失败: " + cmd + " / " + t.getMessage()); }
     }
 
     private void parseRemoteSize(String text) {
@@ -444,11 +491,9 @@ public class MainActivity extends Activity {
                             int w = Integer.parseInt(wh[0]);
                             int h = Integer.parseInt(wh[1]);
                             if (w >= 240 && h >= 240) {
-                                remoteWidth = w;
-                                remoteHeight = h;
+                                remoteWidth = w; remoteHeight = h;
                                 log(String.format(Locale.US, "远端分辨率: %dx%d", remoteWidth, remoteHeight));
-                                updateStatus();
-                                return;
+                                updateStatus(); return;
                             }
                         } catch (Throwable ignored) {}
                     }
@@ -459,8 +504,7 @@ public class MainActivity extends Activity {
 
     private void updateVideoSize() {
         VideoProfile p = getVideoProfile();
-        streamWidth = p.width;
-        streamHeight = p.height;
+        streamWidth = p.width; streamHeight = p.height;
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 if (surfaceView != null) {
@@ -475,37 +519,33 @@ public class MainActivity extends Activity {
     private void toggleFillMode() {
         fillMode = !fillMode;
         updateVideoSize();
-        log(fillMode ? "显示模式：铺满/裁切。触控坐标已按裁切模式映射。" : "显示模式：适应/完整显示。触控坐标已按适应模式映射。");
+        log(fillMode ? "显示模式：铺满/裁切。" : "显示模式：适应/完整显示。 ");
     }
 
     private void toggleQualityMode() {
         qualityMode = (qualityMode + 1) % 3;
         updateVideoSize();
-        log("画质档位：" + getQualityName() + "。正在预览时请点停止后重新开始，使新档位生效。");
+        log("画质档位：" + getQualityName() + "。正在预览时请停止后重新启动。 ");
     }
 
     private void swapRemoteSize() {
-        int t = remoteWidth;
-        remoteWidth = remoteHeight;
-        remoteHeight = t;
+        int t = remoteWidth; remoteWidth = remoteHeight; remoteHeight = t;
         updateVideoSize();
-        log("已交换远端宽高为 " + remoteWidth + "x" + remoteHeight + "。如果画面/触控方向不对，停止后重新开始预览。");
+        log("已交换远端宽高为 " + remoteWidth + "x" + remoteHeight + "。 ");
     }
 
     private VideoProfile getVideoProfile() {
-        if (qualityMode == 2) {
-            return new VideoProfile(makeEven(remoteWidth), makeEven(remoteHeight), 12000000, false);
-        }
+        if (qualityMode == 2) return new VideoProfile(makeEven(remoteWidth), makeEven(remoteHeight), 0, 12000000);
         int longSide = qualityMode == 0 ? 1280 : 1920;
         int[] wh = scaleToLongSide(remoteWidth, remoteHeight, longSide);
         int br = qualityMode == 0 ? 4000000 : 8000000;
-        return new VideoProfile(wh[0], wh[1], br, true);
+        return new VideoProfile(wh[0], wh[1], longSide, br);
     }
 
     private String getQualityName() {
-        if (qualityMode == 0) return "流畅 720p/4Mbps";
-        if (qualityMode == 1) return "清晰 1080p/8Mbps";
-        return "原生/12Mbps";
+        if (qualityMode == 0) return "流畅 max_size=1280 / 4Mbps";
+        if (qualityMode == 1) return "清晰 max_size=1920 / 8Mbps";
+        return "原生 / 12Mbps";
     }
 
     private int[] scaleToLongSide(int w, int h, int longSide) {
@@ -515,18 +555,16 @@ public class MainActivity extends Activity {
         return new int[] { makeEven(Math.round(w * scale)), makeEven(Math.round(h * scale)) };
     }
 
-    private int makeEven(int v) {
-        v = Math.max(2, v);
-        return (v % 2 == 0) ? v : v - 1;
-    }
+    private int makeEven(int v) { v = Math.max(2, v); return (v % 2 == 0) ? v : v - 1; }
 
     private void updateStatus() {
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 if (statusView == null) return;
                 String adbState = (adb != null && adb.isConnected()) ? "ADB:已连接" : "ADB:未连接";
+                String ctrlState = (scrcpyControl != null && scrcpyControl.isReady()) ? "SCRCPY控制:已连接" : "SCRCPY控制:未连接";
                 String usbState = selectedDevice == null ? "USB:未选择" : "USB:" + selectedDevice.getDeviceName();
-                statusView.setText(usbState + "  |  " + adbState + "  |  远端:" + remoteWidth + "x" + remoteHeight + "  |  视频:" + streamWidth + "x" + streamHeight + "  |  " + (fillMode ? "铺满" : "适应"));
+                statusView.setText(usbState + "  |  " + adbState + "  |  " + ctrlState + "  |  远端:" + remoteWidth + "x" + remoteHeight + "  |  " + (fillMode ? "铺满" : "适应"));
             }
         });
     }
@@ -535,23 +573,16 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < raw.length(); i++) {
             char c = raw.charAt(i);
-            if (c == ' ') {
-                sb.append("%s");
-            } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-                sb.append(c);
-            } else if ("_-.,@:/".indexOf(c) >= 0) {
-                sb.append('\\').append(c);
-            } else {
-                // Android's input text command is not reliable for non-ASCII text.
-                sb.append(' ');
-            }
+            if (c == ' ') sb.append("%s");
+            else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) sb.append(c);
+            else if ("_-.,@:/".indexOf(c) >= 0) sb.append('\\').append(c);
+            else sb.append(' ');
         }
         return sb.toString().trim().replace(" ", "");
     }
 
     private void closeAdb() {
-        AdbConnection c = adb;
-        adb = null;
+        AdbConnection c = adb; adb = null;
         if (c != null) c.close();
     }
 
@@ -564,33 +595,20 @@ public class MainActivity extends Activity {
     }
 
     private void log(final String text) {
-        runOnUiThread(new Runnable() {
-            @Override public void run() {
-                if (logView != null) logView.append(text + "\n");
-            }
-        });
+        runOnUiThread(new Runnable() { @Override public void run() { if (logView != null) logView.append(text + "\n"); } });
     }
 
-    private int dp(int value) {
-        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
-    }
+    private int dp(int value) { return (int) (value * getResources().getDisplayMetrics().density + 0.5f); }
 
     private static final class Point {
-        final int x;
-        final int y;
+        final int x, y;
         Point(int x, int y) { this.x = x; this.y = y; }
     }
 
     private static final class VideoProfile {
-        final int width;
-        final int height;
-        final int bitRate;
-        final boolean useSizeOption;
-        VideoProfile(int width, int height, int bitRate, boolean useSizeOption) {
-            this.width = width;
-            this.height = height;
-            this.bitRate = bitRate;
-            this.useSizeOption = useSizeOption;
+        final int width, height, maxSize, bitRate;
+        VideoProfile(int width, int height, int maxSize, int bitRate) {
+            this.width = width; this.height = height; this.maxSize = maxSize; this.bitRate = bitRate;
         }
     }
 }
