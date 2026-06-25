@@ -16,18 +16,25 @@ public final class ScreenRecordStreamer {
 
     private final AdbConnection adb;
     private final Surface surface;
-    private final int width;
-    private final int height;
+    private final int videoWidth;
+    private final int videoHeight;
+    private final int bitRate;
+    private final boolean useSizeOption;
     private final LogSink log;
+
     private volatile boolean running;
+    private volatile AdbStream currentStream;
     private Thread thread;
     private MediaCodec decoder;
 
-    public ScreenRecordStreamer(AdbConnection adb, Surface surface, int width, int height, LogSink log) {
+    public ScreenRecordStreamer(AdbConnection adb, Surface surface, int videoWidth, int videoHeight,
+                                int bitRate, boolean useSizeOption, LogSink log) {
         this.adb = adb;
         this.surface = surface;
-        this.width = Math.max(width, 320);
-        this.height = Math.max(height, 240);
+        this.videoWidth = Math.max(videoWidth, 320);
+        this.videoHeight = Math.max(videoHeight, 240);
+        this.bitRate = Math.max(bitRate, 1000000);
+        this.useSizeOption = useSizeOption;
         this.log = log;
     }
 
@@ -42,36 +49,41 @@ public final class ScreenRecordStreamer {
 
     public void stop() {
         running = false;
-        try { if (decoder != null) decoder.stop(); } catch (Throwable ignored) {}
-        try { if (decoder != null) decoder.release(); } catch (Throwable ignored) {}
-        decoder = null;
+        AdbStream s = currentStream;
+        if (s != null) {
+            try { s.close(); } catch (Throwable ignored) {}
+        }
+        releaseDecoder();
     }
 
     private void streamLoop() {
         try {
             setupDecoder();
             while (running) {
-                log("Starting adb screenrecord H.264 stream...");
+                log("Starting screenrecord stream: " + videoWidth + "x" + videoHeight + " @ " + (bitRate / 1000000f) + "Mbps");
                 AdbStream stream = null;
                 try {
                     stream = openScreenRecordStream();
+                    currentStream = stream;
                     pump(stream);
                 } catch (Throwable t) {
-                    log("Stream stopped: " + t.getMessage());
+                    if (running) log("Stream stopped: " + t.getMessage());
                 } finally {
+                    currentStream = null;
                     if (stream != null) stream.close();
                 }
-                if (running) Thread.sleep(600);
+                if (running) Thread.sleep(350);
             }
         } catch (Throwable t) {
             log("Decoder error: " + t.getMessage());
         } finally {
-            stop();
+            running = false;
+            releaseDecoder();
         }
     }
 
     private AdbStream openScreenRecordStream() throws Exception {
-        String cmd = "screenrecord --output-format=h264 --bit-rate 4000000 -";
+        String cmd = buildScreenRecordCommand();
         try {
             return adb.openStream("exec:" + cmd);
         } catch (Throwable execFailed) {
@@ -80,15 +92,28 @@ public final class ScreenRecordStreamer {
         }
     }
 
+    private String buildScreenRecordCommand() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("screenrecord --output-format=h264 --bit-rate ").append(bitRate);
+        if (useSizeOption) {
+            sb.append(" --size ").append(videoWidth).append("x").append(videoHeight);
+        }
+        // Some Android versions stop screenrecord automatically after a few minutes.
+        // The loop above restarts it when that happens.
+        sb.append(" -");
+        return sb.toString();
+    }
+
     private void setupDecoder() throws Exception {
         decoder = MediaCodec.createDecoderByType("video/avc");
-        MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
+        MediaFormat format = MediaFormat.createVideoFormat("video/avc", videoWidth, videoHeight);
+        try { format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024); } catch (Throwable ignored) {}
         if (Build.VERSION.SDK_INT >= 30) {
             try { format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); } catch (Throwable ignored) {}
         }
         decoder.configure(format, surface, null, 0);
         decoder.start();
-        log("MediaCodec AVC decoder started: " + width + "x" + height);
+        log("MediaCodec AVC decoder started: " + videoWidth + "x" + videoHeight);
     }
 
     private void pump(AdbStream stream) throws Exception {
@@ -96,26 +121,54 @@ public final class ScreenRecordStreamer {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         long pts = 0;
         while (running && !stream.isClosed()) {
-            byte[] data = stream.read(1000);
+            drainOutput(info);
+            byte[] data = stream.read(500);
             if (data == null) continue;
             List<byte[]> nals = parser.push(data);
             for (byte[] nal : nals) {
-                int inIndex = decoder.dequeueInputBuffer(10000);
-                if (inIndex >= 0) {
-                    ByteBuffer input = getInputBuffer(decoder, inIndex);
-                    if (input == null) continue;
-                    input.clear();
-                    int len = Math.min(input.remaining(), nal.length);
-                    input.put(nal, 0, len);
-                    decoder.queueInputBuffer(inIndex, 0, len, pts, 0);
-                    pts += 33333;
-                }
-                int outIndex;
-                do {
-                    outIndex = decoder.dequeueOutputBuffer(info, 0);
-                    if (outIndex >= 0) decoder.releaseOutputBuffer(outIndex, true);
-                } while (outIndex >= 0);
+                queueNal(nal, pts);
+                pts += 16666; // prefer low-latency pacing; real timestamps are not provided by screenrecord raw stream
+                drainOutput(info);
             }
+        }
+    }
+
+    private void queueNal(byte[] nal, long pts) throws Exception {
+        if (decoder == null || nal == null || nal.length == 0) return;
+        int inIndex = decoder.dequeueInputBuffer(3000);
+        if (inIndex >= 0) {
+            ByteBuffer input = getInputBuffer(decoder, inIndex);
+            if (input == null) return;
+            input.clear();
+            int len = Math.min(input.remaining(), nal.length);
+            input.put(nal, 0, len);
+            decoder.queueInputBuffer(inIndex, 0, len, pts, 0);
+        }
+    }
+
+    private void drainOutput(MediaCodec.BufferInfo info) {
+        if (decoder == null) return;
+        while (true) {
+            int outIndex;
+            try {
+                outIndex = decoder.dequeueOutputBuffer(info, 0);
+            } catch (Throwable t) {
+                return;
+            }
+            if (outIndex >= 0) {
+                try { decoder.releaseOutputBuffer(outIndex, true); } catch (Throwable ignored) {}
+            } else {
+                return;
+            }
+        }
+    }
+
+    private void releaseDecoder() {
+        MediaCodec d = decoder;
+        decoder = null;
+        if (d != null) {
+            try { d.stop(); } catch (Throwable ignored) {}
+            try { d.release(); } catch (Throwable ignored) {}
         }
     }
 
