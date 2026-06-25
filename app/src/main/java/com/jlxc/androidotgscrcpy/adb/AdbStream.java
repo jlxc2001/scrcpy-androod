@@ -21,7 +21,7 @@ public final class AdbStream {
 
     int getLocalId() { return localId; }
     int getRemoteId() { return remoteId; }
-    boolean isClosed() { return closed; }
+    public boolean isClosed() { return closed; }
 
     void onOkay(int remoteId) {
         synchronized (openLock) {
