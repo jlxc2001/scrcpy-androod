@@ -82,7 +82,14 @@ public final class ScreenRecordStreamer {
                     }
                     releaseDecoder();
                 }
-                if (running) Thread.sleep(450);
+                if (running) {
+                    try {
+                        Thread.sleep(450);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             }
         } finally {
             running = false;
