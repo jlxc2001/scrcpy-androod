@@ -27,6 +27,13 @@ public final class ScreenRecordStreamer {
     private Thread thread;
     private MediaCodec decoder;
 
+    private byte[] sps;
+    private byte[] pps;
+    private boolean decoderStarted;
+    private long totalBytes;
+    private long totalNals;
+    private long lastProgressLog;
+
     public ScreenRecordStreamer(AdbConnection adb, Surface surface, int videoWidth, int videoHeight,
                                 int bitRate, boolean useSizeOption, LogSink log) {
         this.adb = adb;
@@ -58,36 +65,51 @@ public final class ScreenRecordStreamer {
 
     private void streamLoop() {
         try {
-            setupDecoder();
             while (running) {
-                log("Starting screenrecord stream: " + videoWidth + "x" + videoHeight + " @ " + (bitRate / 1000000f) + "Mbps");
+                resetDecoderState();
+                log("Starting video stream: " + videoWidth + "x" + videoHeight + " @ " + (bitRate / 1000000f) + "Mbps");
                 AdbStream stream = null;
                 try {
                     stream = openScreenRecordStream();
                     currentStream = stream;
                     pump(stream);
                 } catch (Throwable t) {
-                    if (running) log("Stream stopped: " + t.getMessage());
+                    if (running) log("Video stream stopped: " + t.getClass().getSimpleName() + ": " + t.getMessage());
                 } finally {
                     currentStream = null;
-                    if (stream != null) stream.close();
+                    if (stream != null) {
+                        try { stream.close(); } catch (Throwable ignored) {}
+                    }
+                    releaseDecoder();
                 }
-                if (running) Thread.sleep(350);
+                if (running) Thread.sleep(450);
             }
-        } catch (Throwable t) {
-            log("Decoder error: " + t.getMessage());
         } finally {
             running = false;
             releaseDecoder();
         }
     }
 
+    private void resetDecoderState() {
+        sps = null;
+        pps = null;
+        decoderStarted = false;
+        totalBytes = 0;
+        totalNals = 0;
+        lastProgressLog = System.currentTimeMillis();
+        releaseDecoder();
+    }
+
     private AdbStream openScreenRecordStream() throws Exception {
         String cmd = buildScreenRecordCommand();
+        // Prefer exec: because it is the closest thing to adb exec-out and does not allocate a PTY.
+        // PTY based shell streams may corrupt binary H.264 on some devices.
         try {
+            log("Opening ADB exec stream: " + cmd);
             return adb.openStream("exec:" + cmd);
         } catch (Throwable execFailed) {
-            log("exec: failed, falling back to shell:. Reason: " + execFailed.getMessage());
+            log("exec: open failed, falling back to shell:. " + execFailed.getMessage());
+            log("Opening ADB shell stream: " + cmd);
             return adb.openStream("shell:" + cmd);
         }
     }
@@ -98,42 +120,78 @@ public final class ScreenRecordStreamer {
         if (useSizeOption) {
             sb.append(" --size ").append(videoWidth).append("x").append(videoHeight);
         }
-        // Some Android versions stop screenrecord automatically after a few minutes.
-        // The loop above restarts it when that happens.
         sb.append(" -");
         return sb.toString();
-    }
-
-    private void setupDecoder() throws Exception {
-        decoder = MediaCodec.createDecoderByType("video/avc");
-        MediaFormat format = MediaFormat.createVideoFormat("video/avc", videoWidth, videoHeight);
-        try { format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024); } catch (Throwable ignored) {}
-        if (Build.VERSION.SDK_INT >= 30) {
-            try { format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); } catch (Throwable ignored) {}
-        }
-        decoder.configure(format, surface, null, 0);
-        decoder.start();
-        log("MediaCodec AVC decoder started: " + videoWidth + "x" + videoHeight);
     }
 
     private void pump(AdbStream stream) throws Exception {
         H264NalParser parser = new H264NalParser();
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         long pts = 0;
+        long startedAt = System.currentTimeMillis();
         while (running && !stream.isClosed()) {
             drainOutput(info);
             byte[] data = stream.read(500);
-            if (data == null) continue;
+            if (data == null) {
+                if (totalBytes == 0 && System.currentTimeMillis() - startedAt > 2500) {
+                    log("No video bytes yet. Target may not support: screenrecord --output-format=h264 -");
+                    startedAt = System.currentTimeMillis();
+                }
+                continue;
+            }
+            totalBytes += data.length;
             List<byte[]> nals = parser.push(data);
+            if (nals.size() == 0) {
+                logProgress(false);
+                continue;
+            }
             for (byte[] nal : nals) {
-                queueNal(nal, pts);
-                pts += 16666; // prefer low-latency pacing; real timestamps are not provided by screenrecord raw stream
+                int type = nalType(nal);
+                totalNals++;
+                if (type == 7) {
+                    sps = copy(nal);
+                    log("H.264 SPS received (" + nal.length + " bytes)");
+                    tryStartDecoder();
+                    continue;
+                }
+                if (type == 8) {
+                    pps = copy(nal);
+                    log("H.264 PPS received (" + nal.length + " bytes)");
+                    tryStartDecoder();
+                    continue;
+                }
+                if (!decoderStarted) {
+                    if (type >= 0) logProgress(false);
+                    continue;
+                }
+                int flags = 0;
+                if (type == 5) flags |= MediaCodec.BUFFER_FLAG_KEY_FRAME;
+                queueNal(nal, pts, flags);
+                pts += 16666;
                 drainOutput(info);
             }
+            logProgress(decoderStarted);
         }
     }
 
-    private void queueNal(byte[] nal, long pts) throws Exception {
+    private void tryStartDecoder() throws Exception {
+        if (decoderStarted || sps == null || pps == null) return;
+        decoder = MediaCodec.createDecoderByType("video/avc");
+        MediaFormat format = MediaFormat.createVideoFormat("video/avc", videoWidth, videoHeight);
+        try { format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024); } catch (Throwable ignored) {}
+        if (Build.VERSION.SDK_INT >= 30) {
+            try { format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); } catch (Throwable ignored) {}
+        }
+        // Some Android decoders stay black unless SPS/PPS is provided as csd before start().
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
+        format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
+        decoder.configure(format, surface, null, 0);
+        decoder.start();
+        decoderStarted = true;
+        log("MediaCodec AVC decoder started after SPS/PPS: " + videoWidth + "x" + videoHeight);
+    }
+
+    private void queueNal(byte[] nal, long pts, int flags) throws Exception {
         if (decoder == null || nal == null || nal.length == 0) return;
         int inIndex = decoder.dequeueInputBuffer(3000);
         if (inIndex >= 0) {
@@ -142,7 +200,7 @@ public final class ScreenRecordStreamer {
             input.clear();
             int len = Math.min(input.remaining(), nal.length);
             input.put(nal, 0, len);
-            decoder.queueInputBuffer(inIndex, 0, len, pts, 0);
+            decoder.queueInputBuffer(inIndex, 0, len, pts, flags);
         }
     }
 
@@ -157,6 +215,8 @@ public final class ScreenRecordStreamer {
             }
             if (outIndex >= 0) {
                 try { decoder.releaseOutputBuffer(outIndex, true); } catch (Throwable ignored) {}
+            } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                try { log("Decoder output format: " + decoder.getOutputFormat()); } catch (Throwable ignored) {}
             } else {
                 return;
             }
@@ -166,10 +226,48 @@ public final class ScreenRecordStreamer {
     private void releaseDecoder() {
         MediaCodec d = decoder;
         decoder = null;
+        decoderStarted = false;
         if (d != null) {
             try { d.stop(); } catch (Throwable ignored) {}
             try { d.release(); } catch (Throwable ignored) {}
         }
+    }
+
+    private void logProgress(boolean decoding) {
+        long now = System.currentTimeMillis();
+        if (now - lastProgressLog < 1500) return;
+        lastProgressLog = now;
+        if (totalBytes == 0) return;
+        String state;
+        if (decoding) state = "decoding";
+        else if (sps == null || pps == null) state = "waiting SPS/PPS";
+        else state = "waiting decoder";
+        log("Video data: " + totalBytes + " bytes, " + totalNals + " NALs, " + state);
+    }
+
+    private static int nalType(byte[] nal) {
+        int pos = startCodeEnd(nal);
+        if (pos < 0 || pos >= nal.length) return -1;
+        return nal[pos] & 0x1F;
+    }
+
+    private static int startCodeEnd(byte[] data) {
+        if (data == null || data.length < 5) return -1;
+        if (data[0] == 0 && data[1] == 0 && data[2] == 1) return 3;
+        if (data.length >= 6 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) return 4;
+        for (int i = 0; i + 4 < data.length && i < 8; i++) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                if (data[i + 2] == 1) return i + 3;
+                if (data[i + 2] == 0 && data[i + 3] == 1) return i + 4;
+            }
+        }
+        return -1;
+    }
+
+    private static byte[] copy(byte[] src) {
+        byte[] out = new byte[src.length];
+        System.arraycopy(src, 0, out, 0, src.length);
+        return out;
     }
 
     private static ByteBuffer getInputBuffer(MediaCodec codec, int index) {
